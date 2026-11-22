@@ -6,32 +6,69 @@ Usage: ./run_matrix.py DECK.DATA [--solvers cpr_trueimpes cprw system_cpr system
 Each solver is a --linear-solver preset name or a JSON file. Flow is started through
 `mpirun -np 1` (a singleton MPI start of this build hangs). Use --jobs 1 for timings.
 With --csv, one row per run is appended (see CSV_FIELDS); the table printed at the end
-shows the median over the repeats.
+shows the counts and the median times over the repeats.
+
+Every run gets its own output folder: if `out_<deck>_<config><tag>` exists already, the
+run goes to `..._a2`, `..._a3` and so on, so old logs are never mixed with new ones.
+The script exits with status 1 if a run failed, timed out or left no complete summary,
+so that a campaign script does not take its table as done.
 """
-import csv
-import statistics
 import argparse
+import csv
+import hashlib
+import math
 import os
 import re
+import shutil
+import statistics
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 FLOW = os.environ.get('FLOW', 'flow')
-CSV_FIELDS = ['deck', 'config', 'repeat', 'flow_version', 'steps', 'newton', 'linear', 'wasted_lin',
-              'total', 'lin_time', 'lin_setup', 'chops', 'switches', 'rc', 'wall']
+CSV_FIELDS = ['deck', 'config', 'repeat', 'flow_version', 'flow_sha256', 'out', 'steps', 'newton',
+              'linear', 'wasted_lin', 'total', 'lin_time', 'lin_setup', 'chops', 'switches',
+              'well_time', 'well_inner_its', 'well_not_converged', 'well_max_rel_res',
+              'well_mean_rel_res', 'rc', 'wall']
+# Printed by the System solver at the end of a run with "well_solve_stats": true.
+WELL_STATS = re.compile(r'System well solves \(run total\): linear_solves=\d+ applications=\d+ '
+                        r'well_solves=\d+ inner_iterations=(\d+) not_converged=(\d+) time=([\d.]+) '
+                        r'max_rel_residual=(\S+) mean_rel_residual=(\S+)')
 
 
-def run(deck, solver, extra, tag, timeout):
-    out = 'out_%s_%s%s' % (os.path.splitext(os.path.basename(deck))[0],
-                           os.path.splitext(os.path.basename(solver))[0], tag)
-    os.makedirs(out, exist_ok=True)
-    cmd = (['timeout', str(timeout)] if timeout else []) + ['mpirun', '-np', '1', FLOW, deck, '--output-dir=' + out, '--linear-solver=' + solver,
+def flow_sha256():
+    path = shutil.which(FLOW) or FLOW
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def reserve_dir(base):
+    """Create and return a new output folder: base, or base_a2, base_a3, ... if taken."""
+    out, n = base, 1
+    while True:
+        try:
+            os.makedirs(out)
+            return out
+        except FileExistsError:
+            n += 1
+            out = '%s_a%d' % (base, n)
+
+
+def run(deck, solver, extra, out, timeout, parallel):
+    # Open MPI binds every `mpirun -np 1` to the same core, so concurrent runs
+    # would share one core. Do not bind when several runs go at once; a single
+    # (timing) run keeps the default binding.
+    bind = ['--bind-to', 'none'] if parallel else []
+    cmd = (['timeout', str(timeout)] if timeout else []) + ['mpirun', '-np', '1'] + bind + [FLOW, deck, '--output-dir=' + out, '--linear-solver=' + solver,
            '--threads-per-process=1'] + extra
     t0 = time.time()
     with open(os.path.join(out, 'run.log'), 'w') as log:
         rc = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ, OMP_NUM_THREADS='1'))
-    return solver, out, rc, time.time() - t0
+    return rc, time.time() - t0
 
 
 def parse(out):
@@ -52,7 +89,16 @@ def parse(out):
         'switches': len(re.findall(r'control mode changed', prt)),
         'flow_version': (re.search(r'(flow \S+|OPM Flow version \S+)', txt) or [''])[0],
     }
+    m = WELL_STATS.search(txt)
+    if m:
+        r.update(well_inner_its=int(m.group(1)), well_not_converged=int(m.group(2)),
+                 well_time=float(m.group(3)), well_max_rel_res=float(m.group(4)),
+                 well_mean_rel_res=float(m.group(5)))
     return r
+
+
+def complete(r):
+    return all(not (isinstance(r[k], float) and math.isnan(r[k])) for k in ('steps', 'newton', 'linear', 'total'))
 
 
 def main():
@@ -66,32 +112,61 @@ def main():
     p.add_argument('--timeout', type=int, default=0, help='seconds per run, 0 for none')
     p.add_argument('--csv', help='append one row per run to this CSV file')
     a = p.parse_args()
-    jobs = [(s, r) for s in a.solvers for r in range(a.repeat)]
+    sha = flow_sha256()
+    name = lambda s: os.path.splitext(os.path.basename(s))[0]
+    deckname = os.path.splitext(os.path.basename(a.deck))[0]
     tag = lambda r: a.tag + ('_r%d' % r if a.repeat > 1 else '')
+    # Reserve the output folders up front, in order, so parallel runs cannot collide.
+    jobs = [(s, rep, reserve_dir('out_%s_%s%s' % (deckname, name(s), tag(rep))))
+            for s in a.solvers for rep in range(a.repeat)]
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        res = list(ex.map(lambda j: run(a.deck, j[0], a.extra.split(), tag(j[1]), a.timeout) + (j[1],), jobs))
+        res = list(ex.map(lambda j: run(a.deck, j[0], a.extra.split(), j[2], a.timeout, a.jobs > 1), jobs))
     rows = []
-    for solver, out, rc, wall, rep in res:
+    for (solver, rep, out), (rc, wall) in zip(jobs, res):
         r = parse(out)
-        r.update(deck=os.path.basename(a.deck), config=os.path.splitext(os.path.basename(solver))[0],
-                 repeat=rep, rc=rc, wall=round(wall, 2))
+        r.update(deck=os.path.basename(a.deck), config=name(solver), repeat=rep, rc=rc,
+                 wall=round(wall, 2), flow_sha256=sha, out=out)
         rows.append(r)
     if a.csv:
-        new = not os.path.exists(a.csv)
+        fields = CSV_FIELDS
+        if os.path.exists(a.csv):
+            with open(a.csv, newline='') as f:
+                fields = next(csv.reader(f), CSV_FIELDS)
         with open(a.csv, 'a', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction='ignore')
-            if new:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+            if not os.path.getsize(a.csv):
                 w.writeheader()
             w.writerows(rows)
     print('%-22s %5s %6s %6s %6s %8s %8s %8s %6s %6s %3s' % (
         'solver', 'steps', 'newton', 'linear', 'wst%', 'total s', 'lin s', 'setup s', 'chops', 'switch', 'rc'))
+    problems = []
     for solver in a.solvers:
-        rs = [r for r in rows if r['config'] == os.path.splitext(os.path.basename(solver))[0]]
-        med = lambda k: statistics.median(r[k] for r in rs)
+        rs = [r for r in rows if r['config'] == name(solver)]
+        ok = [r for r in rs if r['rc'] == 0 and complete(r)]
+        for r in rs:
+            if r not in ok:
+                problems.append('%s repeat %d: rc=%d%s (%s)' % (
+                    r['config'], r['repeat'], r['rc'], '' if complete(r) else ', no complete summary', r['out']))
+        if not ok:
+            print('%-22s %s' % (name(solver), 'no successful run'))
+            continue
+        counts = {(r['steps'], r['newton'], r['linear']) for r in ok}
+        if len(counts) > 1:
+            problems.append('%s: counts differ between repeats: %s' % (name(solver), sorted(counts)))
+        med = lambda k: statistics.median(r[k] for r in ok)
         print('%-22s %5s %6s %6s %6.1f %8.2f %8.2f %8.2f %6d %6d %3d' % (
-            rs[0]['config'], rs[0]['steps'], rs[0]['newton'], rs[0]['linear'], rs[0]['wasted_lin'],
-            med('total'), med('lin_time'), med('lin_setup'), rs[0]['chops'], rs[0]['switches'],
+            ok[0]['config'], ok[0]['steps'], ok[0]['newton'], ok[0]['linear'], ok[0]['wasted_lin'],
+            med('total'), med('lin_time'), med('lin_setup'), ok[0]['chops'], ok[0]['switches'],
             max(r['rc'] for r in rs)))
+        if 'well_time' in ok[0]:
+            print('%-22s well solves: %.2f s, %d inner its, %d not converged, max rel res %.2e, mean %.2e' % (
+                '', med('well_time'), ok[0]['well_inner_its'], ok[0]['well_not_converged'],
+                ok[0]['well_max_rel_res'], ok[0]['well_mean_rel_res']))
+    print('flow %s sha256 %s' % (shutil.which(FLOW) or FLOW, sha))
+    for msg in problems:
+        print('WARNING: ' + msg)
+    failed = any(r['rc'] != 0 or not complete(r) for r in rows)
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == '__main__':
