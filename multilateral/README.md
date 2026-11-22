@@ -29,7 +29,7 @@ mpirun -np 1 flow SECTOR01_ML8_S2.DATA --linear-solver=configs/cprw.json --threa
 - `*_noid` keep the contracted coarse equation of pressure-controlled wells instead of a trivial one (`well_identity_on_pressure_control: false`).
 - `cprw_contract_d*` contract the well block D for the coarse diagonal of multisegment wells in classic CPRW (`well_coarse_diagonal: contract_d`), as `system_cprw` does.
 - `*_fgmres` use an FGMRES outer solver.
-- `*_inexact_*` use iterative inner well solves (FGMRES + DILU). The `*_inexact_it5_{classic,no_prolongation,full}` files differ from `*_inexact_it5` only in `well_transfer`.
+- `*_inexact_*` use iterative inner well solves (FGMRES + DILU). The `*_inexact_it5_{classic,no_prolongation,full}` files differ from `*_inexact_it5` only in `well_transfer`, and `system_cprw_inexact_it1_{no_prolongation,full}` differ from `system_cprw_inexact_it1` only in `well_transfer`.
 
 Classic and System configurations with the same coarse matrix, which give the same iterates with exact well solves:
 
@@ -74,7 +74,9 @@ On the fishbone decks the matched classic and System pairs agree only to a few p
 
 `run_matrix.py` starts flow with `mpirun -np 1`. When it runs several at once (`--jobs` > 1) it adds `--bind-to none`, since Open MPI otherwise binds every run to the same core. It exits with status 1 if a run failed, timed out or left no complete summary, and gives every run a new output folder.
 
-`run_matrix.py DECK --solvers cfg.json ... [--repeat 3] [--timeout 3600] [--csv out.csv] [--jobs N]` runs several configurations and prints iteration and timing medians. `FLOW=/path/to/flow` selects the binary. Run timing runs one at a time.
+`run_matrix.py DECK --solvers cfg.json ... [--repeat 3] [--timeout 3600] [--csv out.csv] [--jobs N] [--well-stats] [--allow-failed]` runs several configurations and prints iteration and timing medians. `FLOW=/path/to/flow` selects the binary. Run timing runs one at a time.
+- `--well-stats` turns on the well-solve counters of the System-* JSON files: each file is copied into the run's output folder with `"well_solve_stats": "true"`. The other configurations run unchanged.
+- `--allow-failed` exits with status 0 even if runs failed, for sweeps where a failing configuration is a result. The failed runs are still listed.
 
 ## Regenerating
 

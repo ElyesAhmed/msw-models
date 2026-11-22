@@ -11,11 +11,18 @@ shows the counts and the median times over the repeats.
 Every run gets its own output folder: if `out_<deck>_<config><tag>` exists already, the
 run goes to `..._a2`, `..._a3` and so on, so old logs are never mixed with new ones.
 The script exits with status 1 if a run failed, timed out or left no complete summary,
-so that a campaign script does not take its table as done.
+so that a campaign script does not take its table as done. With --allow-failed it exits
+with 0 anyway (for sweeps where a failing configuration is a result); the failed runs are
+still listed in the table.
+
+--well-stats switches on the well-solve counters of the System-* JSON configurations
+("well_solve_stats": "true"): the JSON file is copied into the output folder with the key
+set, and flow runs with the copy. Other configurations are run unchanged.
 """
 import argparse
 import csv
 import hashlib
+import json
 import math
 import os
 import re
@@ -56,6 +63,22 @@ def reserve_dir(base):
         except FileExistsError:
             n += 1
             out = '%s_a%d' % (base, n)
+
+
+def with_well_stats(solver, out):
+    """Path of a copy of a System-* JSON config with the well-solve counters on; other solvers unchanged."""
+    if not solver.endswith('.json'):
+        return solver
+    with open(solver) as f:
+        cfg = json.load(f)
+    prec = cfg.get('preconditioner', {})
+    if not str(prec.get('type', '')).startswith('system'):
+        return solver
+    prec['well_solve_stats'] = 'true'
+    path = os.path.join(out, os.path.basename(solver))
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    return path
 
 
 def run(deck, solver, extra, out, timeout, parallel):
@@ -111,6 +134,10 @@ def main():
     p.add_argument('--repeat', type=int, default=1)
     p.add_argument('--timeout', type=int, default=0, help='seconds per run, 0 for none')
     p.add_argument('--csv', help='append one row per run to this CSV file')
+    p.add_argument('--well-stats', action='store_true',
+                   help='switch on the well-solve counters of System-* JSON configs')
+    p.add_argument('--allow-failed', action='store_true',
+                   help='exit with 0 even if runs failed (they are still listed)')
     a = p.parse_args()
     sha = flow_sha256()
     name = lambda s: os.path.splitext(os.path.basename(s))[0]
@@ -119,8 +146,10 @@ def main():
     # Reserve the output folders up front, in order, so parallel runs cannot collide.
     jobs = [(s, rep, reserve_dir('out_%s_%s%s' % (deckname, name(s), tag(rep))))
             for s in a.solvers for rep in range(a.repeat)]
+    used = [with_well_stats(s, out) if a.well_stats else s for s, rep, out in jobs]
     with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        res = list(ex.map(lambda j: run(a.deck, j[0], a.extra.split(), j[2], a.timeout, a.jobs > 1), jobs))
+        res = list(ex.map(lambda j: run(a.deck, j[1], a.extra.split(), j[0][2], a.timeout, a.jobs > 1),
+                          zip(jobs, used)))
     rows = []
     for (solver, rep, out), (rc, wall) in zip(jobs, res):
         r = parse(out)
@@ -166,7 +195,7 @@ def main():
     for msg in problems:
         print('WARNING: ' + msg)
     failed = any(r['rc'] != 0 or not complete(r) for r in rows)
-    sys.exit(1 if failed else 0)
+    sys.exit(1 if failed and not a.allow_failed else 0)
 
 
 if __name__ == '__main__':
